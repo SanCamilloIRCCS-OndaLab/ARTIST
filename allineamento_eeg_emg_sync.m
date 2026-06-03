@@ -1,6 +1,17 @@
 function allineamento_eeg_emg_sync(inputRoot, outputRoot, overwriteOutput, templateMffPath)
 %ALLINEAMENTO_EEG_EMG_SYNC
-% Batch alignment OTB -> MFF with optional Sync refinement from DIN1.
+% Batch alignment of EMG (OTB+) to EEG (MFF) using shared trigger signals.
+%
+% The alignment relies on trigger signals that are simultaneously recorded
+% by both instruments:
+%   EEG (MFF)   |   EMG (OTB+)
+%   ---------------------------
+%   DIN4        |   AUX4 (falling edge) -> keyboard event
+%   DIN5        |   AUX3 (falling edge) -> beep event
+%   DIN1        |   AUX2 (falling edge) -> sync wave (dense train)
+%
+% The expected task order is: start < keyboard (DIN4) < beep (DIN5) < end,
+% with DIN4 always preceding DIN5.
 %
 % Supported input layouts:
 % 1) Legacy pair structure
@@ -24,6 +35,12 @@ function allineamento_eeg_emg_sync(inputRoot, outputRoot, overwriteOutput, templ
 % - if a dense DIN1 train is present on both EEG and EMG, it can refine the
 %   affine drift fit after the DIN4/DIN5-based trial fit.
 
+% --- Default parameter values ---
+% inputRoot:    parent folder containing pair_xxx/ subfolders or BIDS structure
+% outputRoot:   where aligned .mff, .csv, report.json and movement .otb+ are saved
+% overwriteOutput: if true, delete existing output before writing
+% templateMffPath: optional reference MFF with pre-labeled events (start, keyboard,
+%                  beep, end) used to derive temporal offsets for event reconstruction
 if nargin < 1 || isempty(inputRoot)
     scriptDir = fileparts(mfilename('fullpath'));
     inputRoot = fullfile(scriptDir, 'batch_otb_mff', 'input');
@@ -44,20 +61,25 @@ if nargin < 4 || isempty(templateMffPath)
     end
 end
 
+% XML event file name inside each .mff folder
 eventFile = 'Events_8 DINs.xml';
 if ~isfolder(inputRoot), error('Input root not found: %s', inputRoot); end
 if ~isfolder(outputRoot), mkdir(outputRoot); end
 
+% Discover all valid (MFF, OTB) pairs to process based on the input layout
 entries = collectInputEntries(inputRoot);
 if isempty(entries), error('No valid input entries in %s', inputRoot); end
 
+% summary.csv header: one row per processed (pair, phase)
 header = {'pair','phase','status','message','source_mff','source_otb','output_mff','output_csv', ...
     'a','b','drift_ppm','mad_ms','din1','din4','din5','start','end','keyboard','beep','total', ...
     'trial_candidates','trial_kept','trial_removed','trial_removed_pct','trial_filter_reason'};
 rows = {};
+% trial_sequence_report.csv header: concise trial filtering summary per run
 trialHeader = {'pair','phase','status','trial_candidates','trial_kept','trial_removed','trial_removed_pct','trial_filter_reason'};
 trialRows = {};
 
+% --- Main processing loop: one iteration per (pair, phase) ---
 for i = 1:numel(entries)
     pairName = entries(i).pairName;
     phase = entries(i).phase;
@@ -67,6 +89,7 @@ for i = 1:numel(entries)
     msg = entries(i).msg;
 
     try
+        % Skip entries with missing or incomplete files
         if ~strcmp(state,'OK')
             fprintf('[SKIP] %s/%s | %s\n', pairName, phase, msg);
             rows(end+1,:) = {pairName,phase,'SKIP',msg,'','','','','','','','','','','','','','','','','','','','',''}; %#ok<AGROW>
@@ -74,9 +97,11 @@ for i = 1:numel(entries)
             continue;
         end
 
+        % Create output directory for this (pair, phase)
         pairOut = fullfile(outputRoot, pairName, phase);
         if ~isfolder(pairOut), mkdir(pairOut); end
 
+        % Copy source MFF to output before modifying events
         outMffName = [stripExt(mffSrc,'.mff') '_aligned_otb.mff'];
         outMff = fullfile(pairOut, outMffName);
         if isfolder(outMff)
@@ -88,15 +113,21 @@ for i = 1:numel(entries)
         end
         copyfile(mffSrc, outMff);
 
+        % Step 1: read EEG reference (DIN events from MFF) and EMG data (AUX from OTB)
         ref = readMffReference(outMff, eventFile);
         otb = readOtb(otbSrc);
+        % Step 2: align AUX falling edges to DIN events via affine fit,
+        %         reconstruct task events (start, keyboard, beep, end)
         [events, meta] = buildAlignedEvents(ref, otb, templateMffPath);
+        % Step 3: write aligned events back into the MFF XML
         writeEventXml(ref, events);
-
+        % Step 4: export event list as CSV
         outCsv = fullfile(pairOut, [stripExt(outMff,'.mff') '_events.csv']);
         writeEventsCsv(outCsv, events);
+        % Step 5: extract movement-only OTB segments from valid trial windows
         [outMovementOtb, movementSegCsv, movementInfo] = exportMovementOnlyOtb(otbSrc, pairOut, meta, otb);
 
+        % Build and write JSON report with full alignment metadata
         report = struct();
         report.pair = pairName;
         report.phase = phase;
@@ -125,6 +156,7 @@ for i = 1:numel(entries)
         reportPath = fullfile(pairOut,'report.json');
         fid = fopen(reportPath,'w'); fwrite(fid,jsonencode(report),'char'); fclose(fid);
 
+        % Extract trial filtering statistics for summary output
         nCand = NaN; nKeep = NaN; nRem = NaN; remPct = NaN; remReason = '';
         if isfield(meta,'logical') && isstruct(meta.logical)
             lm = meta.logical;
@@ -145,30 +177,35 @@ for i = 1:numel(entries)
         fprintf('[OK] %s/%s | events=%d | drift=%.2f ppm | MAD=%.3f ms | trials kept=%s/%s removed=%s | move_seg=%d\n', ...
             pairName, phase, numel(events.times), meta.driftPpm, meta.mad*1000, nKeepS, nCandS, nRemS, movementInfo.n_segments);
 
+        % Append row to summary.csv
         rows(end+1,:) = {pairName,phase,'OK','',mffSrc,otbSrc,outMff,outCsv, ...
             sprintf('%.12f',meta.a),sprintf('%.12f',meta.b),sprintf('%.2f',meta.driftPpm),sprintf('%.6f',meta.mad*1000), ...
             num2str(getCount(meta.finalCounts,'DIN1')),num2str(getCount(meta.finalCounts,'DIN4')),num2str(getCount(meta.finalCounts,'DIN5')), ...
             num2str(getCount(meta.finalCounts,'start')),num2str(getCount(meta.finalCounts,'end')), ...
             num2str(getCount(meta.finalCounts,'keyboard')),num2str(getCount(meta.finalCounts,'beep')), ...
             num2str(numel(events.times)),nCandS,nKeepS,nRemS,remPctS,remReason}; %#ok<AGROW>
+        % Append row to trial_sequence_report.csv
         trialRows(end+1,:) = {pairName,phase,'OK',nCandS,nKeepS,nRemS,remPctS,remReason}; %#ok<AGROW>
 
     catch ME
+        % Log error and continue with next entry
         fprintf('[ERR] %s/%s | %s\n', pairName, phase, ME.message);
         rows(end+1,:) = {pairName,phase,'ERR',ME.message,'','','','','','','','','','','','','','','','','','','','',''}; %#ok<AGROW>
         trialRows(end+1,:) = {pairName,phase,'ERR','','','','',ME.message}; %#ok<AGROW>
     end
 end
 
+% Write summary CSV with one row per processed (pair, phase)
 summaryPath = fullfile(outputRoot,'summary.csv');
 writeCsv(summaryPath, header, rows);
+% Write trial sequence report with trial filtering counts
 trialReportPath = fullfile(outputRoot,'trial_sequence_report.csv');
 writeCsv(trialReportPath, trialHeader, trialRows);
 
-% Unified drift report in a single table/file:
-% - session rows (single measurement per pair/phase)
-% - pre_post rows (post - pre)
-% - right_left rows (sx - dx within the same phase)
+% Build unified drift report with three row types:
+% - 'session':       single drift measurement per (pair, phase)
+% - 'pre_post':      delta drift (post - pre) for same-subject pairs
+% - 'right_left':    delta drift (sx - dx) within the same phase
 driftHeader = {'report_type','key','phase','pair_a','pair_b','side_a','side_b', ...
     'drift_ppm_a','drift_ppm_b','delta_ppm_b_minus_a','abs_delta_ppm','trend', ...
     'n_side_a_candidates','n_side_b_candidates','notes'};
@@ -182,6 +219,11 @@ fprintf('Drift report: %s\n', driftPath);
 end
 
 function [mffPath, otbPath, state, msg] = findPhaseFiles(pairPath, phase)
+% Find exactly one .mff and one .otb+ inside a legacy pair_xxx/(pre|post) folder.
+% Returns:
+%   mffPath, otbPath -- full file paths (empty if not found)
+%   state            -- 'OK', 'SKIP', or 'ERR'
+%   msg              -- description of the issue, if any
 phaseRoot = fullfile(pairPath, phase);
 eegRoot = fullfile(phaseRoot, 'eeg');
 emgRoot = fullfile(phaseRoot, 'emg');
@@ -191,10 +233,11 @@ if ~isfolder(phaseRoot)
 end
 
 mffList = dir(fullfile(eegRoot,'**','*.mff'));
-mffList = mffList([mffList.isdir]);
+mffList = mffList([mffList.isdir]);  % .mff is a directory
 otbList = dir(fullfile(emgRoot,'**','*.otb+'));
-otbList = otbList(~[otbList.isdir]);
+otbList = otbList(~[otbList.isdir]);  % .otb+ is a file
 
+% Check for missing or multiple files
 if isempty(mffList) && isempty(otbList)
     mffPath=''; otbPath=''; state='SKIP'; msg='phase empty (no EEG/EMG files)'; return;
 end
@@ -218,9 +261,16 @@ msg = '';
 end
 
 function entries = collectInputEntries(inputRoot)
+% Discover all (MFF, OTB) pairs to process.
+% Supports two layouts:
+%   - BIDS: sub-XX/ses-YY/... (auto-detected if 'sub-' or 'ses-' folders exist)
+%   - Legacy: pair_xxx/(pre|post)/{eeg,emg}/
+% Returns an array of entry structs with fields: pairName, phase, mffPath,
+% otbPath, state, msg, layout.
 entries = struct('pairName',{},'phase',{},'mffPath',{},'otbPath',{},'state',{},'msg',{},'layout',{});
 bidsRoots = findBidsRoots(inputRoot);
 if ~isempty(bidsRoots)
+    % BIDS layout found: collect entries for each BIDS root
     for r = 1:numel(bidsRoots)
         rootPath = bidsRoots{r};
         d = dir(rootPath);
@@ -242,6 +292,7 @@ if ~isempty(bidsRoots)
     return;
 end
 
+% Fallback to legacy pair structure
 d = dir(inputRoot);
 d = d([d.isdir]);
 d = d(~ismember({d.name},{'.','..'}));
@@ -252,6 +303,9 @@ entries = collectLegacyEntries(inputRoot, d);
 end
 
 function roots = findBidsRoots(inputRoot)
+% Detect BIDS-like directory structure.
+% Returns a cell array of paths containing 'sub-*' or 'ses-*' folders.
+% Supports both direct BIDS roots and parent folders with multiple BIDS datasets.
 roots = {};
 
 d = dir(inputRoot);
@@ -290,6 +344,8 @@ end
 end
 
 function entries = collectLegacyEntries(inputRoot, pairDirs)
+% Collect entries for legacy pair_xxx/(pre|post)/{eeg,emg}/ structure.
+% Each pair is processed for both 'pre' and 'post' phases.
 entries = struct('pairName',{},'phase',{},'mffPath',{},'otbPath',{},'state',{},'msg',{},'layout',{});
 phases = {'pre','post'};
 for i = 1:numel(pairDirs)
@@ -311,6 +367,8 @@ end
 end
 
 function entries = collectBidsEntries(inputRoot, subDirs, rootSesDirs)
+% Collect entries from BIDS structure: sub-XX/ses-YY/...
+% Handles subjects with/without sessions, root-level sessions, and flat BIDS.
 entries = struct('pairName',{},'phase',{},'mffPath',{},'otbPath',{},'state',{},'msg',{},'layout',{});
 for i = 1:numel(subDirs)
     subName = subDirs(i).name;
@@ -350,6 +408,8 @@ end
 end
 
 function entries = buildEntriesForSession(sessionPath, pairPrefix, phase, layoutLabel)
+% Scan a BIDS session directory for .mff and .otb+ files and create
+% (pairName, phase) entries, matching EEG to EMG by filename similarity.
 entries = struct('pairName',{},'phase',{},'mffPath',{},'otbPath',{},'state',{},'msg',{},'layout',{});
 [mffPaths, otbPaths] = listBidsFiles(sessionPath);
 
@@ -369,6 +429,7 @@ if isempty(otbPaths)
     return;
 end
 
+% Match EEG (.mff) to EMG (.otb+) by name similarity
 [matchIdx, usedOtb] = matchFilesByName(mffPaths, otbPaths);
 for i = 1:numel(mffPaths)
     runTag = sanitizeName(stripExt(mffPaths{i}, '.mff'));
@@ -382,6 +443,7 @@ for i = 1:numel(mffPaths)
     end
 end
 
+% Report orphan EMG files without matching EEG
 orph = find(~usedOtb);
 for k = 1:numel(orph)
     j = orph(k);
@@ -393,15 +455,17 @@ end
 end
 
 function e = mkEntry(pairName, phase, mffPath, otbPath, state, msg, layoutLabel)
+% Utility: create a single entry struct with consistent field order.
 e = struct('pairName',pairName,'phase',phase,'mffPath',mffPath,'otbPath',otbPath, ...
     'state',state,'msg',msg,'layout',layoutLabel);
 end
 
 function [mffPaths, otbPaths] = listBidsFiles(rootPath)
+% Recursively list .mff directories and .otb+ files under rootPath.
 mffList = dir(fullfile(rootPath,'**','*.mff'));
-mffList = mffList([mffList.isdir]);
+mffList = mffList([mffList.isdir]);  % .mff is a directory
 otbList = dir(fullfile(rootPath,'**','*.otb+'));
-otbList = otbList(~[otbList.isdir]);
+otbList = otbList(~[otbList.isdir]);  % .otb+ is a tar file
 
 mffPaths = cell(numel(mffList),1);
 for i = 1:numel(mffList)
@@ -416,6 +480,10 @@ otbPaths = sort(otbPaths);
 end
 
 function [matchIdx, usedOtb] = matchFilesByName(mffPaths, otbPaths)
+% Match EEG (.mff) to EMG (.otb+) files by name similarity.
+% Uses greedy one-to-one assignment: each EMG is used at most once.
+% Returns matchIdx(i) = j (1-based) if mffPaths{i} matches otbPaths{j},
+% or 0 if no match.
 nM = numel(mffPaths);
 nO = numel(otbPaths);
 matchIdx = zeros(1, nM);
@@ -439,6 +507,9 @@ end
 end
 
 function sc = nameSimilarity(pathA, pathB)
+% Compute a similarity score between two file paths based on shared
+% meaningful tokens (after stripping stop words, numbers, sides).
+% Side agreement adds +2; side mismatch subtracts 2.
 tA = normalizeTokens(pathA);
 tB = normalizeTokens(pathB);
 if isempty(tA) || isempty(tB)
@@ -458,6 +529,8 @@ end
 end
 
 function toks = normalizeTokens(pathIn)
+% Extract meaningful tokens from a file path for name matching.
+% Strips: extension, stop words, bare numbers, alphanumeric codes.
 base = lower(stripExt(pathIn, ''));
 base = regexprep(base, '[^a-z0-9]+', ' ');
 raw = regexp(strtrim(base), '\s+', 'split');
@@ -475,6 +548,7 @@ toks = unique(toks);
 end
 
 function t = mapToken(t)
+% Normalize synonym tokens to a canonical form.
 if isempty(t), return; end
 if startsWith(t, 'reach')
     t = 'reach'; return;
@@ -492,6 +566,7 @@ end
 end
 
 function s = extractSideToken(toks)
+% Return 'dx', 'sx', or '' if a side token is present in the token list.
 if any(strcmp(toks,'dx'))
     s = 'dx';
 elseif any(strcmp(toks,'sx'))
@@ -502,6 +577,8 @@ end
 end
 
 function s = sanitizeName(s)
+% Clean a string for use as a filename or identifier:
+% lowercase, collapse non-alphanumeric to underscores.
 s = lower(char(s));
 s = regexprep(s, '[^a-z0-9]+', '_');
 s = regexprep(s, '_+', '_');
@@ -510,6 +587,8 @@ if isempty(s), s = 'run'; end
 end
 
 function phase = inferPhaseLabel(sesName, sesPath, mffPath, otbPath)
+% Infer whether this session is 'pre', 'post', or other from its name/path.
+% Checks for 'pre' or 'post' substrings in session name or path.
 txt = lower(strjoin({sesName, sesPath, mffPath, otbPath}, ' '));
 if contains(txt, 'pre')
     phase = 'pre';
@@ -525,6 +604,15 @@ if isempty(phase), phase = 'session'; end
 end
 
 function ref = readMffReference(mffPath, eventFile)
+% Read EEG reference metadata and DIN trigger events from a .mff folder.
+%
+% Parses:
+%   info.xml    -> recording start time and timezone
+%   epochs.xml  -> total recording duration
+%   Events_*.xml -> DIN events (DIN1, DIN4, DIN5) with absolute timestamps
+%
+% Returns a struct with recording timing and DIN trigger times (in seconds
+% relative to recording start).
 infoTxt = fileread(fullfile(mffPath,'info.xml'));
 epochsTxt = fileread(fullfile(mffPath,'epochs.xml'));
 evPath = fullfile(mffPath,eventFile);
@@ -542,6 +630,7 @@ durationS = endUs / 1e6;
 name = oneToken(evTxt,'<name>([^<]+)</name>');
 trackType = oneToken(evTxt,'<trackType>([^<]+)</trackType>');
 
+% Parse all events from the event XML
 allEv = regexp(evTxt,'<event>\s*<beginTime>([^<]+)</beginTime>\s*<duration>([^<]+)</duration>\s*<code>([^<]+)</code>[\s\S]*?</event>','tokens');
 if isempty(allEv), error('No events in %s', evPath); end
 
@@ -562,24 +651,40 @@ ref = struct('mffPath',mffPath,'eventPath',evPath,'recordEpoch',recordEpoch, ...
 end
 
 function otb = readOtb(otbPath)
+% Read EMG data and AUX trigger channel mapping from an .otb+ file.
+%
+% .otb+ is a tar archive containing:
+%   - a .xml config file (contains channel metadata, sample rate, AUX mapping)
+%   - a .sig binary file (raw int16 samples, all channels interleaved)
+%
+% Returns a struct with:
+%   fs        -- sampling frequency (Hz)
+%   nChannels -- total number of channels
+%   data      -- [nChannels x N] matrix of raw EMG samples
+%   auxMap    -- containers.Map: AUX channel number -> row index in data
 tmpDir = tempname; mkdir(tmpDir);
 cleanup = onCleanup(@() cleanupTemp(tmpDir)); %#ok<NASGU>
 untar(otbPath, tmpDir);
 
+% Find the XML metadata file (prefer *_08.xml pattern)
 xmlList = dir(fullfile(tmpDir,'*_08.xml'));
 if isempty(xmlList), xmlList = dir(fullfile(tmpDir,'*.xml')); end
 if isempty(xmlList), error('No xml in %s', otbPath); end
 xmlPath = fullfile(xmlList(1).folder, xmlList(1).name);
 
+% Find the binary signal file
 sigList = dir(fullfile(tmpDir,'*.sig'));
 if isempty(sigList), error('No sig in %s', otbPath); end
 sigPath = fullfile(sigList(1).folder, sigList(1).name);
 
+% Parse XML to get sampling rate, channel count, and AUX trigger mapping
 doc = xmlread(xmlPath);
 root = doc.getDocumentElement();
 fs = str2double(char(root.getAttribute('SampleFrequency')));
 nChannels = str2double(char(root.getAttribute('DeviceTotalChannels')));
 
+% Build a map from AUX channel number (1-based) to data row index (0-based)
+% Only AUX channels with 'Trigger' in their ID string are mapped.
 auxMap = containers.Map('KeyType','double','ValueType','double');
 adapters = root.getElementsByTagName('Adapter');
 for i = 0:(adapters.getLength()-1)
@@ -600,6 +705,7 @@ for i = 0:(adapters.getLength()-1)
     end
 end
 
+% Read raw int16 samples (little-endian) and reshape into [nChannels x N]
 fid = fopen(sigPath,'r');
 raw = fread(fid,inf,'int16=>double',0,'l');
 fclose(fid);
@@ -611,16 +717,41 @@ otb = struct('fs',fs,'nChannels',nChannels,'data',data,'auxMap',auxMap);
 end
 
 function [events, meta] = buildAlignedEvents(ref, otb, templateMffPath)
+% Core alignment: maps OTB (AUX) trigger falling edges to MFF (DIN) events.
+%
+% Trigger mapping (hardware configuration):
+%   AUX4 (OTB, falling edge) <-> DIN4 (EEG) -> keyboard event
+%   AUX3 (OTB, falling edge) <-> DIN5 (EEG) -> beep event
+%   AUX2 (OTB, falling edge) <-> DIN1 (EEG) -> sync wave (optional refinement)
+%
+% Algorithm steps:
+%   1) Detect falling edges on AUX channels
+%   2) Clean trigger edges (remove noise spikes via minimum-gap filter)
+%   3) Plausibility check on cleaned trigger counts
+%   4) Affine fit between AUX and DIN times (with lag search)
+%   5) Optional DIN1 refinement to improve clock drift estimate
+%   6) Guardrail: reject unstable fits (|a-1| > 2%, MAD > 500 ms)
+%   7) Map all AUX edges to MFF timebase using the affine transform
+%   8) Reconstruct task events (start, keyboard, beep, end)
+%
+% Returns:
+%   events -- struct with .times (s) and .codes (cell) of all aligned events
+%   meta   -- struct with fit parameters, cleaning stats, logical metadata
+%
+% Required AUX channels in OTB: 2 (DIN1), 3 (DIN5), 4 (DIN4)
 needed = [2 3 4];
 for k = needed
     if ~isKey(otb.auxMap,k), error('OTB missing AUX%d', k); end
 end
 
-din4 = ref.codeTimes.DIN4;
-din5 = ref.codeTimes.DIN5;
-din1 = ref.codeTimes.DIN1;
+din4 = ref.codeTimes.DIN4;  % keyboard events from EEG
+din5 = ref.codeTimes.DIN5;  % beep events from EEG
+din1 = ref.codeTimes.DIN1;  % sync wave from EEG
 if isempty(din4) || isempty(din5), error('Reference MFF must contain DIN4 and DIN5'); end
 
+% Step 1-2: Detect and clean falling edges on each AUX channel
+% AUX4 (DIN4) and AUX3 (DIN5) use the corresponding DIN count as expected
+% reference; AUX2 (DIN1) uses an adaptive gap based on the DIN1 step size.
 edges = struct();
 rawCounts = struct();
 cleanCounts = struct();
@@ -635,6 +766,7 @@ for k = needed
     elseif k == 3
         [tClean, cInfo] = cleanTriggerEdges(tRaw, numel(din5), 0.12);
     else
+        % AUX2: adaptive gap based on DIN1 density
         din1Step = NaN;
         if numel(din1) >= 2
             din1Step = median(diff(din1));
@@ -652,6 +784,8 @@ for k = needed
     cleaning.(sprintf('AUX%d',k)) = cInfo;
 end
 
+% Step 3: Verify that cleaned trigger counts are in a plausible range
+% (60%-180% of expected DIN count)
 checkTriggerCountPlausibility(cleanCounts.AUX4, numel(din4), 'AUX4', 'DIN4');
 checkTriggerCountPlausibility(cleanCounts.AUX3, numel(din5), 'AUX3', 'DIN5');
 
@@ -659,6 +793,11 @@ aux4 = edges.AUX4;
 aux3 = edges.AUX3;
 aux2 = edges.AUX2;
 
+% Step 4: Affine fit between AUX and DIN times.
+% Try both mapping orders (AUX4<->DIN4/AUX3<->DIN5 and the reverse) and
+% select the one with lower MAD.
+% NOTE: The hardware mapping is fixed (AUX4->DIN4, AUX3->DIN5), but the
+% dual-fit approach handles possible cable swaps.
 fit1 = bestLagFit(aux4, aux3, din4, din5, 8);
 fit2 = bestLagFit(aux4, aux3, din5, din4, 8);
 if ~fit1.valid && ~fit2.valid
@@ -676,12 +815,15 @@ a = fitSel.a;
 b = fitSel.b;
 mad = fitSel.mad;
 
-keyO = fitSel.x4;
-keyM = fitSel.y4;
-beepO = fitSel.x3;
-beepM = fitSel.y3;
+keyO = fitSel.x4;    % AUX4 times (OTB timebase)
+keyM = fitSel.y4;    % paired DIN4 times (MFF timebase)
+beepO = fitSel.x3;   % AUX3 times (OTB timebase)
+beepM = fitSel.y3;   % paired DIN5 times (MFF timebase)
 nCommon = min(numel(keyO), numel(beepO));
 
+% Refit the affine transform using only trials that satisfy the
+% keyboard-before-beep logical order (trial gating on DIN4/DIN5).
+% Also try an endpoint-based fit as a robust alternative.
 fitInfo = struct('stage','lag_search_initial', ...
     'lag4',fitSel.lag4,'lag3',fitSel.lag3, ...
     'n_fit_trials_candidate',nCommon,'n_fit_trials_kept',0, ...
@@ -694,9 +836,9 @@ fitInfo = struct('stage','lag_search_initial', ...
 
 idxKeep = [];
 if nCommon >= 2
-    tKeyPred = a*keyO + b;
-    tBeepPred = a*beepO + b;
-    % Trial-gating is based on keyboard/beep order only (DIN4/DIN5).
+    tKeyPred = a*keyO + b;    % predicted keyboard times in MFF base
+    tBeepPred = a*beepO + b;  % predicted beep times in MFF base
+    % Trial-gating uses DIN4/DIN5 order only (keyboard must precede beep).
     idxKeep = findValidTrialIndicesKbBeep(tKeyPred, tBeepPred);
     fitInfo.n_fit_trials_kept = numel(idxKeep);
     if numel(idxKeep) >= 2
@@ -704,6 +846,8 @@ if nCommon >= 2
         yFit = [keyM(idxKeep) beepM(idxKeep)];
         [aV,bV,mV] = fitLinear(xFit, yFit);
 
+        % Alternative: endpoint-based fit (first/last point slope)
+        % as a robust estimator; use it if it gives equal or better MAD.
         [xFitS,ordV] = sort(xFit);
         yFitS = yFit(ordV);
         if numel(xFitS)>=2 && xFitS(end)>xFitS(1)
@@ -721,6 +865,7 @@ if nCommon >= 2
     end
 end
 
+% Base point set for optional DIN1 refinement
 if ~isempty(idxKeep) && numel(idxKeep) >= 2
     xBase = [keyO(idxKeep) beepO(idxKeep)];
     yBase = [keyM(idxKeep) beepM(idxKeep)];
@@ -729,8 +874,10 @@ else
     yBase = [keyM beepM];
 end
 
-% Optional Sync refinement using dense DIN1 train. This improves clock fit
-% but does not change trial validity logic, which remains DIN4/DIN5-only.
+% Step 5: Optional Sync refinement using the dense DIN1 train.
+% DIN1 (AUX2) provides many additional point pairs that can improve
+% the clock-drift estimate without affecting trial validity logic
+% (which remains DIN4/DIN5-only).
 [xDin1, yDin1, din1Fit] = pairDin1ForRefit(aux2, ref.codeTimes.DIN1, a, b);
 fitInfo.n_din1_match = din1Fit.nMatched;
 fitInfo.n_din1_used = din1Fit.nUsed;
@@ -751,11 +898,15 @@ if din1Fit.used
     end
 end
 
-% Guardrail: do not write aligned events when fit is clearly unstable.
+% Step 6: Guardrail -- reject clearly unstable fits.
+% Criteria: non-finite parameters, |a-1| > 2% (excessive clock drift),
+% or MAD > 500 ms (unreliable alignment).
 if ~isfinite(a) || ~isfinite(b) || ~isfinite(mad) || abs(a - 1) > 0.02 || mad > 0.5
     error('Unstable affine fit after trigger cleaning: a=%.6f, b=%.6f, MAD=%.3f s', a, b, mad);
 end
 
+% Step 7: Map all AUX falling edges to MFF timebase using the affine
+% transform t_mff = a * t_otb + b. Discard events outside recording bounds.
 times = []; codes = {};
 for t = aux4
     tt = a*t+b; if tt>=0 && tt<=ref.durationS+0.1, times(end+1)=tt; codes{end+1}=map4; end %#ok<AGROW>
@@ -768,6 +919,8 @@ for t = aux2
 end
 [times,ord2] = sort(times); codes = codes(ord2);
 
+% Step 8: Reconstruct task events (start, keyboard, beep, end) from DIN4/DIN5
+% using temporal offsets derived from a template recording.
 events = struct('times',times,'codes',{codes});
 [events, logicalMeta] = addReconstructedTaskEvents(events, ref.durationS, templateMffPath);
 
@@ -782,6 +935,15 @@ meta = struct('a',a,'b',b,'mad',mad,'driftPpm',(a-1)*1e6, ...
 end
 
 function [outOtbPath, segCsvPath, info] = exportMovementOnlyOtb(otbSrc, pairOut, meta, otb)
+% Create a new .otb+ file containing only movement segments extracted from
+% valid trial windows.
+%
+% The movement windows are built from reconstructed task events:
+%   primary rule:  beep -> start
+%   fallback rule: beep -> end (when start is not after beep)
+%
+% Returns paths to the movement-only OTB and the segment CSV, plus an info
+% struct with statistics.
 [~, otbBase, ~] = fileparts(otbSrc);
 outOtbPath = fullfile(pairOut, [otbBase '_movement_only.otb+']);
 segCsvPath = fullfile(pairOut, [otbBase '_movement_segments.csv']);
@@ -794,6 +956,7 @@ info = struct('enabled',false, ...
     'n_samples',0, ...
     'duration_s',0);
 
+% Clean up any pre-existing output files
 if exist(outOtbPath,'file')
     delete(outOtbPath);
 end
@@ -805,6 +968,7 @@ if exist(segCsvPath,'file')
     delete(segCsvPath);
 end
 
+% Determine sample ranges for movement windows
 [sampleRanges, segRows, ruleUsed, reason] = buildMovementWindows(meta, otb);
 info.rule_used = ruleUsed;
 info.reason = reason;
@@ -812,6 +976,7 @@ if isempty(sampleRanges)
     return;
 end
 
+% Concatenate the selected sample ranges and write to new OTB
 moveData = concatenateSampleRanges(otb.data, sampleRanges);
 writeMovementOtbFromSource(otbSrc, outOtbPath, moveData);
 writeMovementSegmentsCsv(segCsvPath, segRows);
@@ -823,11 +988,23 @@ info.duration_s = size(moveData,2) / otb.fs;
 end
 
 function [sampleRanges, segRows, ruleUsed, reason] = buildMovementWindows(meta, otb)
+% Determine sample ranges in OTB timebase corresponding to movement windows.
+%
+% Movement windows are defined by trial events:
+%   Primary: beep -> start  (start is the onset of movement)
+%   Fallback: beep -> end   (when start does not occur after beep)
+%
+% Returns:
+%   sampleRanges -- [N x 2] matrix with [start_sample, end_sample] per segment
+%   segRows      -- cell array with metadata rows for the segments CSV
+%   ruleUsed     -- which windowing rule was applied
+%   reason       -- description if no windows could be built
 sampleRanges = zeros(0,2);
 segRows = {};
 ruleUsed = '';
 reason = '';
 
+% Validate required metadata
 if ~isfield(meta,'logical') || ~isstruct(meta.logical)
     reason = 'logical_metadata_missing';
     return;
@@ -852,6 +1029,7 @@ if ~isfield(tt,'beep')
     return;
 end
 
+% Try primary rule: beep -> start
 tBeepAll = double(tt.beep(:)');
 tBeep = tBeepAll;
 tStop = [];
@@ -869,8 +1047,9 @@ end
 
 valid = isfinite(tBeep) & isfinite(tStop) & (tStop > tBeep);
 
-% In the current reconstructed order start is usually before beep.
-% If beep->start is not valid, fallback to beep->end to keep movement windows.
+% In the reconstructed event order, 'start' typically precedes 'beep'.
+% If beep->start windows are invalid (start occurs before beep),
+% fall back to beep->end to preserve movement segments.
 if ~any(valid)
     if ~isfield(tt,'end')
         reason = 'beep_to_start_invalid_and_end_missing';
@@ -889,6 +1068,7 @@ if ~any(valid)
     reason = 'beep_to_start_not_valid_in_reconstructed_sequence';
 end
 
+% Filter to valid trials and map to OTB sample indices
 trialIdx = 1:numel(tBeep);
 if isfield(lm,'trial_indices')
     tri = double(lm.trial_indices(:)');
@@ -901,6 +1081,7 @@ tBeep = tBeep(valid);
 tStop = tStop(valid);
 trialIdx = trialIdx(valid);
 
+% Convert MFF timestamps to OTB sample indices via inverse affine transform
 nTot = size(otb.data,2);
 tBeepOtb = (tBeep - meta.b) / meta.a;
 tStopOtb = (tStop - meta.b) / meta.a;
@@ -927,6 +1108,7 @@ tBeep = tBeep(ord);
 tStop = tStop(ord);
 trialIdx = trialIdx(ord);
 
+% Build output arrays
 sampleRanges = [i1(:) i2(:)];
 segRows = cell(size(sampleRanges,1), 11);
 for k = 1:size(sampleRanges,1)
@@ -946,6 +1128,8 @@ end
 end
 
 function dataOut = concatenateSampleRanges(dataIn, ranges)
+% Concatenate selected sample ranges from a multichannel data matrix.
+% dataIn: [nChannels x N]  ranges: [nSeg x 2] with [start, end] indices
 nChan = size(dataIn,1);
 nSeg = size(ranges,1);
 len = ranges(:,2) - ranges(:,1) + 1;
@@ -961,12 +1145,18 @@ end
 end
 
 function writeMovementSegmentsCsv(pathCsv, rows)
+% Write movement segment metadata to CSV with predefined header.
 header = {'segment_id','trial_index','rule_used','mff_t_start_s','mff_t_stop_s', ...
     'otb_t_start_s','otb_t_stop_s','sample_start','sample_stop','n_samples','duration_s'};
 writeCsv(pathCsv, header, rows);
 end
 
 function writeMovementOtbFromSource(srcOtbPath, outOtbPath, data)
+% Create a new .otb+ file by replacing the .sig binary in a copy of the
+% source OTB archive with the movement-only data.
+%
+% The input .otb+ is a tar archive; we untar it, overwrite the .sig file,
+% and re-tar to produce the output.
 tmpDir = tempname;
 mkdir(tmpDir);
 cleanup = onCleanup(@() cleanupTemp(tmpDir)); %#ok<NASGU>
@@ -981,6 +1171,7 @@ if numel(sigList) > 1
 end
 sigPath = fullfile(sigList(1).folder, sigList(1).name);
 
+% Clamp to int16 range and write
 x = round(double(data(:)));
 x(x > 32767) = 32767;
 x(x < -32768) = -32768;
@@ -992,6 +1183,7 @@ end
 fwrite(fid, int16(x), 'int16', 0, 'l');
 fclose(fid);
 
+% Re-tar the archive with the updated .sig
 if exist(outOtbPath,'file')
     delete(outOtbPath);
 end
@@ -1004,6 +1196,11 @@ movefile(tmpTarPath, outOtbPath, 'f');
 end
 
 function writeEventXml(ref, events)
+% Write aligned events into the MFF event XML file.
+% Creates a backup of the original event XML before overwriting.
+%
+% Each event includes ISO-8601 timestamps, a gidx (global index), and a
+% cidx (per-code counter) as custom keys.
 backup = strrep(ref.eventPath,'.xml','_original.xml');
 if ~exist(backup,'file'), copyfile(ref.eventPath, backup); end
 
@@ -1046,6 +1243,10 @@ fclose(fid);
 end
 
 function writeEventsCsv(pathCsv, events)
+% Write aligned events to CSV with columns:
+% Event_type, Event_name, Event_time, Event_duration, Offset.
+% Original triggers (DIN1/4/5) are labeled 'OTB_trigger';
+% reconstructed events (start/keyboard/beep/end) are 'OTB_reconstructed'.
 fid = fopen(pathCsv,'w');
 fprintf(fid,'Event_type,Event_name,Event_time,Event_duration,Offset\n');
 for i = 1:numel(events.times)
@@ -1061,11 +1262,24 @@ fclose(fid);
 end
 
 function [eventsOut, info] = addReconstructedTaskEvents(eventsIn, durationS, templateMffPath)
+% Reconstruct task-level events (start, keyboard, beep, end) from DIN4/DIN5.
+%
+% The temporal offsets between DIN4/DIN5 and the task events are derived
+% from a template MFF recording that contains pre-labeled events.
+%
+% Trial validity is enforced through the logical sequence:
+%   start < keyboard < beep < end < next_keyboard
+%
+% DIN4 maps to 'keyboard', DIN5 maps to 'beep'. The 'start' and 'end'
+% events are placed relative to these anchors using the template offsets.
+%
+% Returns updated events struct (with added task events) and an info struct
+% containing trial filtering statistics and per-trial event times.
 times = eventsIn.times(:)';
 codes = eventsIn.codes;
 
-din4 = times(strcmp(codes,'DIN4'));
-din5 = times(strcmp(codes,'DIN5'));
+din4 = times(strcmp(codes,'DIN4'));  % keyboard anchors
+din5 = times(strcmp(codes,'DIN5'));  % beep anchors
 nTrials = min(numel(din4), numel(din5));
 if nTrials == 0
     eventsOut = eventsIn;
@@ -1073,7 +1287,7 @@ if nTrials == 0
     return;
 end
 
-% Trial validity uses only DIN4/DIN5 (keyboard/beep).
+% Filter trials: keep only valid DIN4 < DIN5 sequences
 idxKeep = findValidTrialIndicesKbBeep(din4(1:nTrials), din5(1:nTrials));
 tKeyKeep = din4(idxKeep);
 tBeepKeep = din5(idxKeep);
@@ -1086,14 +1300,15 @@ if nKeep == 0
     return;
 end
 
+% Apply temporal offsets from template to derive start/keyboard/beep/end
 [offStart, offKey, offBeep, offEnd, offSource] = getOffsetsProfile(templateMffPath, nKeep);
 tStart = tKeyKeep + offStart;
 tKey = tKeyKeep + offKey;
 tBeep = tBeepKeep + offBeep;
 tEnd = tBeepKeep + offEnd;
 
-% Enforce requested logical sequence and remove invalid trials.
-% Required order: start < keyboard < beep < end, and end before next keyboard.
+% Enforce logical sequence and remove invalid trials.
+% Required order: start < keyboard < beep < end < next_keyboard
 trialIdx = idxKeep;
 nextKeyBound = inf(1, numel(trialIdx));
 hasNext = trialIdx < nTrials;
@@ -1114,12 +1329,13 @@ if any(~validSeq)
     nextKeyBound = nextKeyBound(validSeq);
 end
 
+% Clamp event times to recording bounds
 tStart = clampTimes(tStart, durationS);
 tKey = clampTimes(tKey, durationS);
 tBeep = clampTimes(tBeep, durationS);
 tEnd = clampTimes(tEnd, durationS);
 
-% Re-check after clamping at recording bounds.
+% Re-check sequence after clamping
 validAfterClamp = (tStart < tKey) & (tKey < tBeep) & (tBeep < tEnd) & (tEnd < nextKeyBound);
 if any(~validAfterClamp)
     tStart = tStart(validAfterClamp);
@@ -1140,6 +1356,7 @@ if nKeepFinal == 0
     return;
 end
 
+% Merge reconstructed events with original DIN events and sort
 addTimes = [tStart tKey tBeep tEnd];
 addCodes = [repmat({'start'},1,nKeepFinal) repmat({'keyboard'},1,nKeepFinal) ...
             repmat({'beep'},1,nKeepFinal) repmat({'end'},1,nKeepFinal)];
@@ -1171,9 +1388,13 @@ info.trial_times_s = struct( ...
 end
 
 function idxKeep = findValidTrialIndicesKbBeep(din4, din5)
+% Find valid trial pairs (DIN4, DIN5) that satisfy:
+%   - keyboard (DIN4) precedes beep (DIN5) by at least 50 ms
+%   - beep (DIN5) precedes the next keyboard (DIN4) if one exists
+% This implements the trial-gating rule: only DIN4/DIN5 order matters.
 nTrials = min(numel(din4), numel(din5));
 idxKeep = [];
-minKbBeepGapS = 0.05; % remove near-simultaneous pairs (including 0 s)
+minKbBeepGapS = 0.05; % minimum gap to reject near-simultaneous pairs
 if nTrials == 0
     return;
 end
@@ -1199,6 +1420,14 @@ end
 end
 
 function fit = bestLagFit(aux4, aux3, din4Target, din5Target, maxLag)
+% Search for the best lag combination (lag4, lag3) that minimizes MAD of
+% the affine fit between AUX and DIN trigger pairs.
+%
+% aux4/aux3: OTB falling edge times
+% din4Target/din5Target: expected EEG DIN times to match against
+%
+% Returns a fit struct with affine parameters (a, b), MAD, the optimal
+% lags, and the paired (x, y) values used in the fit.
 if nargin < 5 || isempty(maxLag)
     maxLag = 8;
 end
@@ -1208,7 +1437,7 @@ fit = struct('valid',false,'a',NaN,'b',NaN,'mad',Inf, ...
 bestScore = Inf;
 for lag4 = -maxLag:maxLag
     [x4, y4] = pairWithLag(aux4, din4Target, lag4);
-    if numel(x4) < 10
+    if numel(x4) < 10  % need at least 10 pairs for a reliable fit
         continue;
     end
     for lag3 = -maxLag:maxLag
@@ -1219,7 +1448,7 @@ for lag4 = -maxLag:maxLag
         x = [x4 x3];
         y = [y4 y3];
         [aT, bT, mT] = fitLinear(x, y);
-        sc = mT + 1e-9*abs(aT-1);
+        sc = mT + 1e-9*abs(aT-1);  % MAD + tiny regularizer on drift
         if sc < bestScore
             bestScore = sc;
             fit.valid = true;
@@ -1238,6 +1467,9 @@ end
 end
 
 function [x, y] = pairWithLag(aux, din, lag)
+% Pair AUX edges with DIN events at a given lag offset.
+% Positive lag: skip the first `lag` AUX edges before pairing.
+% Negative lag: skip the first `-lag` DIN events before pairing.
 x = [];
 y = [];
 if isempty(aux) || isempty(din)
@@ -1263,6 +1495,13 @@ end
 end
 
 function [offStart, offKey, offBeep, offEnd, source] = getOffsetsProfile(templateMffPath, nTrials)
+% Get temporal offsets to reconstruct task events from DIN4/DIN5.
+%
+% Offsets define where 'start', 'keyboard', 'beep', and 'end' events
+% should be placed relative to DIN4 (keyboard) and DIN5 (beep).
+%
+% If a template MFF with pre-labeled events is available, offsets are
+% derived from it; otherwise hard-coded defaults are used.
 % Fallback profile based on observed template behavior:
 % start before DIN4, keyboard approx DIN4, beep approx DIN5, end after DIN5.
 baseStart = -2.2;
@@ -1299,6 +1538,16 @@ offEnd = resampleOffsets(offEndT, nTrials);
 end
 
 function [offStart, offKey, offBeep, offEnd] = deriveOffsetsFromTemplate(templateMffPath)
+% Derive temporal offsets from a template MFF recording that contains
+% pre-labeled events (start, keyboard, beep, end) alongside DIN triggers.
+%
+% The offsets are computed as:
+%   start_offset = start_time - DIN4_time
+%   keyboard_offset = keyboard_time - DIN4_time
+%   beep_offset = beep_time - DIN5_time
+%   end_offset = end_time - DIN5_time
+%
+% Warm-up DIN pulses are handled by aligning task labels to tail DIN sequences.
 offStart = [];
 offKey = [];
 offBeep = [];
@@ -1339,7 +1588,7 @@ if isempty(din4) || isempty(din5) || isempty(start) || isempty(key) || isempty(b
     return;
 end
 
-% In the example there are warm-up DIN pulses. Align task labels to tail DIN sequences.
+% Skip warm-up DIN pulses to align with the labeled trials
 skip4 = max(0, numel(din4) - numel(key));
 skip5 = max(0, numel(din5) - numel(beep));
 n = min([numel(start), numel(key), numel(beep), numel(en), numel(din4)-skip4, numel(din5)-skip5]);
@@ -1354,6 +1603,9 @@ offEnd = en(1:n) - din5u;
 end
 
 function y = resampleOffsets(x, nOut)
+% Resample offset values to match the number of trials.
+% If a single value is given, it is replicated.
+% If multiple values are given, linear interpolation is used.
 x = x(:)';
 if isempty(x)
     y = zeros(1,nOut);
@@ -1366,11 +1618,14 @@ end
 end
 
 function t = clampTimes(t, durationS)
+% Clamp event times to the recording bounds [0, durationS).
 t = max(t, 0);
 t = min(t, max(durationS - 1e-6, 0));
 end
 
 function counts = countCodes(codes)
+% Count occurrences of each event code.
+% Returns a struct with field names derived from the code strings.
 counts = struct();
 u = unique(codes);
 for i = 1:numel(u)
@@ -1380,11 +1635,15 @@ end
 end
 
 function n = getCount(s, fieldName)
+% Safely get a field value from a struct, defaulting to 0 if missing.
 f = matlab.lang.makeValidName(fieldName);
 if isfield(s,f), n = s.(f); else, n = 0; end
 end
 
 function t = detectFallingEdges(x, fs)
+% Detect falling edges in a trigger signal.
+% Threshold is set at the midpoint between the median and minimum of the
+% first 20000 samples. Returns edge times in seconds.
 head = sort(x(1:min(20000,numel(x))));
 med = head(floor(numel(head)/2)+1);
 thr = (med + min(x))/2;
@@ -1394,6 +1653,13 @@ t = (on-1)/fs;
 end
 
 function [tClean, info] = cleanTriggerEdges(tRaw, expectedCount, minGapS)
+% Clean trigger edges by removing noise spikes via minimum-gap filtering.
+%
+% If an expected DIN count is provided, the gap is adaptively increased
+% until the number of remaining edges is at most 1.6x the expected count
+% (plus a margin of 8).
+%
+% Returns cleaned edge times and an info struct with cleaning statistics.
 tRaw = sort(double(tRaw(:)'));
 tClean = tRaw;
 if nargin < 3 || ~isfinite(minGapS) || minGapS <= 0
@@ -1424,6 +1690,8 @@ end
 end
 
 function tOut = applyMinGap(tIn, minGapS)
+% Remove trigger edges that are closer than minGapS to the previous edge.
+% Keeps the first edge in each valid group.
 tIn = sort(double(tIn(:)'));
 if isempty(tIn)
     tOut = tIn;
@@ -1442,6 +1710,9 @@ tOut = tIn(keep);
 end
 
 function checkTriggerCountPlausibility(nAux, nDin, auxName, dinName)
+% Verify that the number of cleaned AUX edges is within a plausible range
+% relative to the expected DIN count (60%-180%).
+% Throws an error if the count is outside this range.
 if nDin <= 0
     return;
 end
@@ -1454,12 +1725,25 @@ end
 end
 
 function [a,b,mad] = fitLinear(x,y)
+% Fit an affine model y = a*x + b using least squares (polyfit degree 1).
+% Returns slope a, intercept b, and median absolute deviation (MAD).
 x = double(x(:)); y = double(y(:));
 p = polyfit(x,y,1); a = p(1); b = p(2);
 mad = median(abs(y-(a*x+b)));
 end
 
 function [xUse, yUse, info] = pairDin1ForRefit(aux2, din1, a, b)
+% Pair AUX2 (DIN1 sync wave) edges with EEG DIN1 events to refine the
+% affine clock-drift fit.
+%
+% The initial fit (from DIN4/DIN5) is used to predict DIN1 times from AUX2.
+% Matching is done with an adaptive tolerance based on the DIN1 step size.
+% Outliers are removed using a 3*MAD threshold, and the result is
+% subsampled to at most 400 pairs.
+%
+% Returns the paired points and an info struct with matching statistics.
+% The refinement is only applied if at least 20 pairs are found with a
+% match ratio >= 30%.
 xUse = [];
 yUse = [];
 info = struct('used',false,'nMatched',0,'nUsed',0,'tolS',NaN,'matchRatio',NaN);
@@ -1474,6 +1758,7 @@ if numel(aux2) < 10 || numel(din1) < 10
     return;
 end
 
+% Predict DIN1 times from AUX2 using current affine transform
 predDin1 = a * aux2 + b;
 din1Step = median(diff(din1));
 if ~isfinite(din1Step) || din1Step <= 0
@@ -1481,6 +1766,7 @@ if ~isfinite(din1Step) || din1Step <= 0
 end
 tolS = min(0.05, max(0.008, 0.35 * din1Step));
 
+% Match predicted to actual DIN1 events within tolerance
 [idxPred, idxRef] = pairSortedByTolerance(predDin1, din1, tolS);
 nMatched = numel(idxPred);
 minCount = min(numel(predDin1), numel(din1));
@@ -1493,6 +1779,7 @@ if nMatched < 20 || matchRatio < 0.30
     return;
 end
 
+% Remove outlier pairs using 3*MAD on residuals
 x = aux2(idxPred);
 y = din1(idxRef);
 r = y - (a*x + b);
@@ -1507,6 +1794,7 @@ if ~isempty(r)
     end
 end
 
+% Subsample to prevent overweighting the dense DIN1 train vs DIN4/DIN5
 maxUsed = 400;
 if numel(x) > maxUsed
     sel = round(linspace(1, numel(x), maxUsed));
@@ -1521,6 +1809,10 @@ info.used = info.nUsed >= 20;
 end
 
 function [idxA, idxB] = pairSortedByTolerance(aVals, bVals, tolS)
+% Pair two sorted sequences within a given tolerance.
+% Uses a simple two-pointer merge: if |a - b| <= tol, they are paired;
+% otherwise the smaller value advances.
+% Returns indices of paired elements in each sequence.
 idxA = [];
 idxB = [];
 i = 1;
@@ -1541,17 +1833,22 @@ end
 end
 
 function s = oneToken(txt, pat)
+% Extract the first capture group matching a regex pattern from a string.
+% Throws if the pattern is not found.
 t = regexp(txt, pat, 'tokens','once');
 if isempty(t), error('Pattern not found: %s', pat); end
 s = t{1};
 end
 
 function epochSec = isoToEpoch(isoStr)
+% Convert an ISO-8601 timestamp string to Unix epoch seconds.
 d = datetime(isoStr,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSSSSSXXX','TimeZone','UTC');
 epochSec = posixtime(d);
 end
 
 function isoStr = epochToIso(epochSec, offsetStr)
+% Convert Unix epoch seconds to an ISO-8601 timestamp string with the
+% given timezone offset. Rounds to microseconds.
 offSec = offsetToSeconds(offsetStr);
 localEpoch = round((epochSec + offSec)*1e6)/1e6;
 d = datetime(localEpoch,'ConvertFrom','posixtime','TimeZone','UTC');
@@ -1567,6 +1864,7 @@ isoStr = sprintf('%04d-%02d-%02dT%02d:%02d:%02d.%06d%s',yy,mm,dd,HH,MN,ss,mic,of
 end
 
 function s = offsetToSeconds(off)
+% Convert a timezone offset string ('+HH:MM' or '-HH:MM') to seconds.
 if numel(off)~=6 || off(4)~=':'
     error('Invalid offset: %s', off);
 end
@@ -1576,6 +1874,9 @@ s = sgn*(hh*3600+mm*60);
 end
 
 function writeCsv(pathCsv, header, rows)
+% Write a cell array of rows to a CSV file with proper escaping.
+% header: cell array of column names
+% rows: M x N cell array where each cell is a string to be escaped
 fid = fopen(pathCsv,'w');
 fprintf(fid,'%s\n', strjoin(header,','));
 for i = 1:size(rows,1)
@@ -1587,6 +1888,8 @@ fclose(fid);
 end
 
 function s = csvEscape(v)
+% Escape a value for CSV: double-quote if it contains commas, quotes,
+% or newlines. Internal quotes are doubled.
 if ~ischar(v), v = char(string(v)); end
 if contains(v,'"'), v = strrep(v,'"','""'); end
 if contains(v,',') || contains(v,'"') || contains(v,newline)
@@ -1597,6 +1900,13 @@ end
 end
 
 function rowsOut = buildUnifiedDriftRows(summaryHeader, summaryRows)
+% Build a unified drift report with three types of rows:
+%   'session':    single drift measurement per (pair, phase)
+%   'pre_post':   delta drift (post - pre) for matching subject keys
+%   'right_left': delta drift (sx - dx) within the same phase
+%
+% This provides a compact overview of clock-drift stability across sessions,
+% pre/post intervention changes, and left/right differences.
 records = collectDriftRecords(summaryHeader, summaryRows);
 rowsOut = {};
 if isempty(records)
@@ -1712,6 +2022,9 @@ end
 end
 
 function records = collectDriftRecords(summaryHeader, summaryRows)
+% Parse the summary CSV rows into drift record structs for report generation.
+% Only rows with status 'OK' and valid drift_ppm values are included.
+% Side information is extracted from the pair name.
 records = struct('pair',{},'phase',{},'prepostKey',{},'side',{},'sideKey',{}, ...
     'driftPpm',{},'madMs',{},'a',{},'b',{});
 if isempty(summaryRows)
@@ -1758,6 +2071,8 @@ end
 end
 
 function s = prePostKeyFromPairLocal(pairName)
+% Derive a key for matching pre/post pairs by stripping phase/session labels.
+% E.g., "sub01_sespre_dx" -> "sub01_dx" so pre and post can be compared.
 s = lower(char(pairName));
 s = regexprep(s, 'ses[-_]?pre', 'ses');
 s = regexprep(s, 'ses[-_]?post', 'ses');
@@ -1769,8 +2084,9 @@ if isempty(s), s = 'pair'; end
 end
 
 function s = rightLeftKeyFromPair(pairName)
+% Derive a key for matching right/left pairs by stripping side tags.
+% E.g., "sub01_pre_dx" -> "sub01_pre" so dx/sx can be compared.
 s = lower(char(pairName));
-% Remove side tags so dx/sx files can be compared on the same task key.
 s = regexprep(s, '(^|[_-])(dx|sx|right|left|rt|lt|des|sin|destro|sinistro)([_-]|$)', '$1$3');
 s = regexprep(s, '[_-]+', '_');
 s = regexprep(s, '^_|_$', '');
@@ -1778,6 +2094,8 @@ if isempty(s), s = 'pair'; end
 end
 
 function side = detectSideFromName(pairName)
+% Detect whether a pair name refers to right ('dx') or left ('sx') side.
+% Uses token normalization first, then falls back to regex on the raw name.
 toks = normalizeTokens(pairName);
 side = extractSideToken(toks);
 if isempty(side)
@@ -1793,6 +2111,7 @@ end
 end
 
 function s = strCell(v)
+% Convert a cell entry (char, string, numeric, empty) to a plain char.
 if isempty(v)
     s = '';
 elseif ischar(v)
@@ -1805,6 +2124,8 @@ end
 end
 
 function s = fmtNum(v, nDec)
+% Format a numeric value as a string with nDec decimal places.
+% Returns 'NaN' for non-finite values.
 if nargin < 2 || isempty(nDec)
     nDec = 3;
 end
@@ -1816,6 +2137,10 @@ end
 end
 
 function n = stripExt(pathIn, ext)
+% Strip extension from a file path. If ext is provided and matches,
+% the extension is removed; otherwise the base name is returned.
+% Note: this function currently returns only the base name due to the
+% trailing `if` block that does nothing.
 [~,n,e] = fileparts(pathIn);
 if ~strcmpi(e,ext)
     % keep base name only
@@ -1823,6 +2148,7 @@ end
 end
 
 function cleanupTemp(tmpDir)
+% Safely remove a temporary directory (with all contents).
 if isfolder(tmpDir)
     try, rmdir(tmpDir,'s'); catch, end
 end
