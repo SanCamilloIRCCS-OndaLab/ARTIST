@@ -794,22 +794,18 @@ aux3 = edges.AUX3;
 aux2 = edges.AUX2;
 
 % Step 4: Affine fit between AUX and DIN times.
-% Try both mapping orders (AUX4<->DIN4/AUX3<->DIN5 and the reverse) and
-% select the one with lower MAD.
-% NOTE: The hardware mapping is fixed (AUX4->DIN4, AUX3->DIN5), but the
-% dual-fit approach handles possible cable swaps.
+% The hardware mapping is fixed:
+%   AUX4 (falling edge) -> DIN4 (keyboard)
+%   AUX3 (falling edge) -> DIN5 (beep)
+% bestLagFit searches for the optimal lag between sequences to handle
+% any constant offset or trigger dropout, but the channel assignment
+% is always AUX4->DIN4 and AUX3->DIN5.
 fit1 = bestLagFit(aux4, aux3, din4, din5, 8);
-fit2 = bestLagFit(aux4, aux3, din5, din4, 8);
-if ~fit1.valid && ~fit2.valid
+if ~fit1.valid
     error('Unable to fit AUX to DIN (insufficient aligned trigger pairs)');
 end
-if fit1.valid && (~fit2.valid || fit1.mad <= fit2.mad)
-    fitSel = fit1;
-    map4 = 'DIN4'; map3 = 'DIN5';
-else
-    fitSel = fit2;
-    map4 = 'DIN5'; map3 = 'DIN4';
-end
+fitSel = fit1;
+map4 = 'DIN4'; map3 = 'DIN5';
 
 a = fitSel.a;
 b = fitSel.b;
